@@ -1,0 +1,14 @@
+﻿{
+  "name": "twitter-unfollow-tool",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Chrome extension to manage unilateral follows on X",
+  "scripts": {
+    "build": "tsc",
+    "check": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/chrome": "^0.0.271",
+    "typescript": "^5.9.3"
+  }
+}

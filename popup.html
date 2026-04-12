@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>片思い解除</title>
+    <style>
+      :root {
+        font-family: "Segoe UI", "Yu Gothic UI", sans-serif;
+      }
+      body {
+        margin: 0;
+        width: 320px;
+        padding: 14px;
+        background: #f7f9fa;
+        color: #1f2328;
+      }
+      h1 {
+        font-size: 16px;
+        margin: 0 0 12px;
+      }
+      .row {
+        margin-bottom: 10px;
+      }
+      label {
+        display: block;
+        font-size: 13px;
+        margin-bottom: 4px;
+      }
+      input[type="number"] {
+        width: 100%;
+        box-sizing: border-box;
+        padding: 8px;
+        border: 1px solid #c3c8cf;
+        border-radius: 8px;
+      }
+      button {
+        border: 0;
+        border-radius: 10px;
+        padding: 9px 12px;
+        font-weight: 600;
+        cursor: pointer;
+      }
+      #scanBtn, #startBtn {
+        width: 100%;
+        background: #1d9bf0;
+        color: #fff;
+      }
+      #stopBtn {
+        width: 100%;
+        background: #f4212e;
+        color: #fff;
+      }
+      #status {
+        white-space: pre-line;
+        font-size: 13px;
+        line-height: 1.5;
+        background: #fff;
+        border-radius: 8px;
+        border: 1px solid #d8dee4;
+        padding: 10px;
+        min-height: 54px;
+      }
+      #startWrap,
+      #stopWrap {
+        display: none;
+      }
+      .muted {
+        font-size: 12px;
+        color: #59636e;
+        margin-top: 8px;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>片思いフォロー解除</h1>
+    <div class="row">
+      <label for="limitInput">上限件数</label>
+      <input id="limitInput" type="number" min="1" max="10000" value="1000" />
+    </div>
+    <div class="row">
+      <button id="scanBtn" type="button">候補件数を取得</button>
+    </div>
+    <div id="startWrap" class="row">
+      <button id="startBtn" type="button">この内容で解除開始</button>
+    </div>
+    <div id="stopWrap" class="row">
+      <button id="stopBtn" type="button">停止</button>
+    </div>
+    <div id="status">待機中です。</div>
+    <div class="muted">Xにログイン済みのタブセッションを利用します。</div>
+    <script type="module" src="dist/popup.js"></script>
+  </body>
+</html>

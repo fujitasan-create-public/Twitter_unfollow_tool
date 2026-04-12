@@ -1,0 +1,23 @@
+{
+  "manifest_version": 3,
+  "name": "X 片思いフォロー解除ツール",
+  "version": "0.1.0",
+  "description": "フォロー中 - フォロワーの差分を抽出し、片思いフォローを解除します。",
+  "permissions": ["tabs", "storage"],
+  "host_permissions": ["https://x.com/*", "https://twitter.com/*"],
+  "background": {
+    "service_worker": "dist/background.js",
+    "type": "module"
+  },
+  "action": {
+    "default_title": "片思いフォロー解除",
+    "default_popup": "popup.html"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://x.com/*", "https://twitter.com/*"],
+      "js": ["dist/content.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}
