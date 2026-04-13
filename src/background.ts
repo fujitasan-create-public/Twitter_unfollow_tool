@@ -1,4 +1,4 @@
-﻿import type { CollectResult, RuntimeState } from "./types";
+﻿import type { RuntimeState } from "./types";
 
 const DEFAULT_LIMIT = 1000;
 const MIN_DELAY_MS = 3000;
@@ -30,6 +30,7 @@ function defaultState(): RuntimeState {
     message: "\u5f85\u6a5f\u4e2d\u3067\u3059\u3002",
     limit: DEFAULT_LIMIT,
     accountHandle: null,
+    previewHandles: [],
     candidateCount: 0,
     targetCount: 0,
     followingCount: 0,
@@ -51,6 +52,10 @@ let followerHandles: string[] = [];
 let scanTabId: number | null = null;
 let scanStopRequested = false;
 let initPromise: Promise<void> | null = null;
+type NonMutualCollectResult = {
+  handles: string[];
+  scannedFollowing: number;
+};
 
 async function persistRuntime(): Promise<void> {
   await chrome.storage.local.set({
@@ -268,14 +273,15 @@ async function resolveHandle(currentTab: chrome.tabs.Tab): Promise<string> {
   return result.handle;
 }
 
-async function collectHandlesOnOnce(url: string): Promise<CollectResult> {
+async function collectHandlesOnOnce(url: string): Promise<NonMutualCollectResult> {
   ensureNotScanStopped();
   const tabId = await ensureXTab(url);
   scanTabId = tabId;
   try {
     const result = await withTimeout(
-      sendMessageToTab<CollectResult>(tabId, {
-        type: "COLLECT_HANDLES"
+      sendMessageToTab<NonMutualCollectResult>(tabId, {
+        type: "COLLECT_NON_MUTUAL_FROM_FOLLOWING",
+        targetCount: state.limit
       }),
       LIST_COLLECTION_TIMEOUT_MS,
       "候補取得"
@@ -305,21 +311,23 @@ function mergeHandles(base: string[], next: string[]): { merged: string[]; added
   return { merged, added };
 }
 
-async function collectHandlesOn(url: string, desiredMinCount: number, label: "following" | "followers"): Promise<CollectResult> {
+async function collectHandlesOn(url: string, desiredMinCount: number): Promise<NonMutualCollectResult> {
   ensureNotScanStopped();
   let merged: string[] = [];
+  let scannedFollowing = 0;
   let noGrowthRounds = 0;
-  const maxAttempts = 4;
+  const maxAttempts = 3;
 
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     ensureNotScanStopped();
     setState({
-      message: `対象 @${state.accountHandle ?? "-"}\n${label} 一覧を取得中... (${attempt}/${maxAttempts})`
+      message: `\u5bfe\u8c61 @${state.accountHandle ?? "-"}\nfollowing\u4e00\u89a7\u3092\u8d70\u67fb\u4e2d... (${attempt}/${maxAttempts})`
     });
 
     const current = await collectHandlesOnOnce(url);
     const result = mergeHandles(merged, current.handles);
     merged = result.merged;
+    scannedFollowing = Math.max(scannedFollowing, current.scannedFollowing);
 
     if (result.added === 0) {
       noGrowthRounds += 1;
@@ -335,7 +343,7 @@ async function collectHandlesOn(url: string, desiredMinCount: number, label: "fo
     }
   }
 
-  return { handles: merged };
+  return { handles: merged, scannedFollowing };
 }
 
 async function runScan(limit: number): Promise<void> {
@@ -345,6 +353,7 @@ async function runScan(limit: number): Promise<void> {
     message: "\u5019\u88dc\u4ef6\u6570\u3092\u53d6\u5f97\u3057\u3066\u3044\u307e\u3059...",
     limit,
     accountHandle: null,
+    previewHandles: [],
     candidateCount: 0,
     targetCount: 0,
     followingCount: 0,
@@ -367,34 +376,27 @@ async function runScan(limit: number): Promise<void> {
 
   const handle = await resolveHandle(activeTab);
   const followingUrl = `${X_ORIGIN}/${handle}/following`;
-  const followersUrl = `${X_ORIGIN}/${handle}/followers`;
 
-  setState({ accountHandle: handle, message: `対象 @${handle}\nfollowing 一覧を取得中...` });
-  const following = await collectHandlesOn(followingUrl, limit, "following");
+  setState({ accountHandle: handle, message: `\u5bfe\u8c61 @${handle}\nfollowing\u4e00\u89a7\u3092\u8d70\u67fb\u4e2d...` });
+  const following = await collectHandlesOn(followingUrl, limit);
   ensureNotScanStopped();
-  const followerDesired = Math.max(limit, following.handles.length);
-  setState({ message: `対象 @${handle}\nfollowers 一覧を取得中...` });
-  const followers = await collectHandlesOn(followersUrl, followerDesired, "followers");
-  ensureNotScanStopped();
-  setCollectedHandles(following.handles, followers.handles);
-
-  const followerSet = new Set(followers.handles.map((h) => h.toLowerCase()));
-  const unilateral = following.handles.filter((h) => !followerSet.has(h.toLowerCase()));
+  setCollectedHandles([], []);
+  const unilateral = following.handles;
   const limited = unilateral.slice(0, limit);
 
   setCandidates(limited);
   setState({
     phase: "ready",
     accountHandle: handle,
+    previewHandles: limited,
     candidateCount: unilateral.length,
     targetCount: limited.length,
-    followingCount: following.handles.length,
-    followerCount: followers.handles.length,
-    message:
-      `\u5bfe\u8c61 @${handle}\n` +
-      `\u7247\u601d\u3044\u30d5\u30a9\u30ed\u30ef\u30fc\u3092\u89e3\u9664\u3057\u307e\u3059\u304b\uff1f\n` +
-      `\u4ef6\u6570 ${unilateral.length} \u4ef6 (\u4e0a\u9650 ${limit})\n` +
-      `取得 following ${following.handles.length} / followers ${followers.handles.length}`
+    followingCount: following.scannedFollowing,
+    followerCount: 0,
+    message: `\u5bfe\u8c61 @${handle}
+following\u5185\u3067\u300c\u30d5\u30a9\u30ed\u30fc\u3055\u308c\u3066\u3044\u307e\u3059\u300d\u304c\u7121\u3044\u5019\u88dc\u3092\u89e3\u9664\u3057\u307e\u3059\u304b\uff1f
+\u4ef6\u6570 ${unilateral.length} \u4ef6 (\u4e0a\u9650 ${limit})
+\u8d70\u67fb following ${following.scannedFollowing} \u4ef6`
   });
 }
 
@@ -575,3 +577,4 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 
   return true;
 });
+

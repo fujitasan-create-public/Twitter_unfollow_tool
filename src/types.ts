@@ -12,6 +12,7 @@ export type RuntimeState = {
   message: string;
   limit: number;
   accountHandle: string | null;
+  previewHandles: string[];
   candidateCount: number;
   targetCount: number;
   followingCount: number;

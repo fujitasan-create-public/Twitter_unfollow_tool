@@ -5,6 +5,8 @@ const stopBtn = document.getElementById("stopBtn");
 const statusEl = document.getElementById("status");
 const startWrap = document.getElementById("startWrap");
 const stopWrap = document.getElementById("stopWrap");
+const previewWrap = document.getElementById("previewWrap");
+const previewList = document.getElementById("previewList");
 function setBusy(button, busy, busyLabel, defaultLabel) {
     button.disabled = busy;
     button.textContent = busy ? busyLabel : defaultLabel;
@@ -26,6 +28,16 @@ function render(state) {
     const disableScan = state.phase === "scanning" || state.phase === "running" || state.phase === "stopping";
     scanBtn.disabled = disableScan;
     limitInput.disabled = disableScan;
+    const hasPreview = state.previewHandles.length > 0 && (state.phase === "ready" || state.phase === "done");
+    previewWrap.style.display = hasPreview ? "block" : "none";
+    if (hasPreview) {
+        previewList.innerHTML = state.previewHandles
+            .map((handle) => `<li>@${handle}</li>`)
+            .join("");
+    }
+    else {
+        previewList.innerHTML = "";
+    }
 }
 async function send(payload) {
     return (await chrome.runtime.sendMessage(payload));

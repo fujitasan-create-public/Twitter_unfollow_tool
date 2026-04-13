@@ -7,6 +7,8 @@ const stopBtn = document.getElementById("stopBtn") as HTMLButtonElement;
 const statusEl = document.getElementById("status") as HTMLDivElement;
 const startWrap = document.getElementById("startWrap") as HTMLDivElement;
 const stopWrap = document.getElementById("stopWrap") as HTMLDivElement;
+const previewWrap = document.getElementById("previewWrap") as HTMLDivElement;
+const previewList = document.getElementById("previewList") as HTMLUListElement;
 
 function setBusy(button: HTMLButtonElement, busy: boolean, busyLabel: string, defaultLabel: string): void {
   button.disabled = busy;
@@ -33,6 +35,16 @@ function render(state: RuntimeState): void {
   const disableScan = state.phase === "scanning" || state.phase === "running" || state.phase === "stopping";
   scanBtn.disabled = disableScan;
   limitInput.disabled = disableScan;
+
+  const hasPreview = state.previewHandles.length > 0 && (state.phase === "ready" || state.phase === "done");
+  previewWrap.style.display = hasPreview ? "block" : "none";
+  if (hasPreview) {
+    previewList.innerHTML = state.previewHandles
+      .map((handle) => `<li>@${handle}</li>`)
+      .join("");
+  } else {
+    previewList.innerHTML = "";
+  }
 }
 
 async function send<T>(payload: unknown): Promise<T> {

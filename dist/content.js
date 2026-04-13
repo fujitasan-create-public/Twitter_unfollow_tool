@@ -14,6 +14,7 @@ const RESERVED = new Set([
 ]);
 const JP_FOLLOWING = "\u30d5\u30a9\u30ed\u30fc\u4e2d";
 const JP_UNFOLLOW = "\u30d5\u30a9\u30ed\u30fc\u89e3\u9664";
+const JP_FOLLOWS_YOU = "\u30d5\u30a9\u30ed\u30fc\u3055\u308c\u3066\u3044\u307e\u3059";
 const USER_ROW_SELECTORS = ['[data-testid="UserCell"]', '[data-testid="cellInnerDiv"]'].join(", ");
 const LIST_LOADING_SELECTORS = ['[role="progressbar"]', '[data-testid="primaryColumn"] [aria-busy="true"]'].join(", ");
 let stopNow = false;
@@ -82,14 +83,17 @@ function collectVisibleHandles(out) {
     }
     return out.size - before;
 }
-async function collectHandlesFromList(targetCount) {
+function isFollowedByUserCell(row) {
+    const text = normalized(row.innerText || "");
+    return text.includes("follows you") || text.includes(normalized(JP_FOLLOWS_YOU));
+}
+async function collectNonMutualFromFollowing(targetCount) {
     stopNow = false;
     await waitForUserCells();
-    const handles = new Set();
+    const nonMutualHandles = new Set();
+    const scannedFollowing = new Set();
     const started = Date.now();
     let lastIncreaseAt = started;
-    const hasTarget = Number.isFinite(targetCount) && targetCount > 0;
-    const safeTarget = hasTarget ? Math.floor(targetCount) : Number.MAX_SAFE_INTEGER;
     let noIncreaseRounds = 0;
     let noHeightIncreaseRounds = 0;
     let rounds = 0;
@@ -99,9 +103,20 @@ async function collectHandlesFromList(targetCount) {
     while (!stopNow &&
         rounds < 320 &&
         Date.now() - started < 300000 &&
-        handles.size < safeTarget &&
+        nonMutualHandles.size < targetCount &&
         (noIncreaseRounds < 30 || noHeightIncreaseRounds < 20 || Date.now() - lastIncreaseAt < 25000 || isListLoading())) {
-        const delta = collectVisibleHandles(handles);
+        const before = nonMutualHandles.size;
+        const rows = queryUserRows();
+        for (const row of rows) {
+            const handle = getHandleFromUserCell(row);
+            if (!handle)
+                continue;
+            scannedFollowing.add(handle.toLowerCase());
+            if (!isFollowedByUserCell(row)) {
+                nonMutualHandles.add(handle);
+            }
+        }
+        const delta = nonMutualHandles.size - before;
         if (delta === 0) {
             noIncreaseRounds += 1;
         }
@@ -125,10 +140,13 @@ async function collectHandlesFromList(targetCount) {
     if (stopNow) {
         throw new Error("候補取得を停止しました。");
     }
-    if (handles.size === 0) {
+    if (scannedFollowing.size === 0) {
         throw new Error("対象ユーザーを取得できませんでした。ページを再読み込みして再実行してください。");
     }
-    return Array.from(handles);
+    return {
+        handles: Array.from(nonMutualHandles),
+        scannedFollowing: scannedFollowing.size
+    };
 }
 async function scrollUntilUserCell(handle) {
     window.scrollTo(0, 0);
@@ -310,11 +328,11 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
             sendResponse({ handle: extractSelfHandle() });
             return;
         }
-        if (message?.type === "COLLECT_HANDLES") {
+        if (message?.type === "COLLECT_NON_MUTUAL_FROM_FOLLOWING") {
             const requested = Number(message.targetCount);
-            const targetCount = Number.isFinite(requested) && requested > 0 ? Math.floor(requested) : undefined;
-            const handles = await collectHandlesFromList(targetCount);
-            sendResponse({ handles });
+            const targetCount = Number.isFinite(requested) && requested > 0 ? Math.floor(requested) : 100;
+            const result = await collectNonMutualFromFollowing(targetCount);
+            sendResponse(result);
             return;
         }
         if (message?.type === "UNFOLLOW_HANDLES") {
