@@ -19,7 +19,10 @@ function render(state) {
         limitInput.value = String(state.limit || 1000);
     }
     startWrap.style.display = state.phase === "ready" ? "block" : "none";
-    stopWrap.style.display = state.phase === "running" || state.phase === "stopping" ? "block" : "none";
+    stopWrap.style.display =
+        state.phase === "scanning" || state.phase === "running" || state.phase === "stopping"
+            ? "block"
+            : "none";
     const disableScan = state.phase === "scanning" || state.phase === "running" || state.phase === "stopping";
     scanBtn.disabled = disableScan;
     limitInput.disabled = disableScan;

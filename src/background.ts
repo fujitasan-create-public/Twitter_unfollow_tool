@@ -3,10 +3,13 @@
 const DEFAULT_LIMIT = 1000;
 const MIN_DELAY_MS = 3000;
 const MAX_DELAY_MS = 8000;
+const LIST_COLLECTION_TIMEOUT_MS = 420000;
 const X_ORIGIN = "https://x.com";
 const STATE_KEY = "runtimeState";
 const CANDIDATES_KEY = "runtimeCandidates";
 const ACTION_TAB_ID_KEY = "runtimeActionTabId";
+const FOLLOWING_HANDLES_KEY = "runtimeFollowingHandles";
+const FOLLOWER_HANDLES_KEY = "runtimeFollowerHandles";
 
 const RESERVED_PATHS = new Set([
   "home",
@@ -43,13 +46,19 @@ function defaultState(): RuntimeState {
 let state: RuntimeState = defaultState();
 let candidates: string[] = [];
 let actionTabId: number | null = null;
+let followingHandles: string[] = [];
+let followerHandles: string[] = [];
+let scanTabId: number | null = null;
+let scanStopRequested = false;
 let initPromise: Promise<void> | null = null;
 
 async function persistRuntime(): Promise<void> {
   await chrome.storage.local.set({
     [STATE_KEY]: state,
     [CANDIDATES_KEY]: candidates,
-    [ACTION_TAB_ID_KEY]: actionTabId
+    [ACTION_TAB_ID_KEY]: actionTabId,
+    [FOLLOWING_HANDLES_KEY]: followingHandles,
+    [FOLLOWER_HANDLES_KEY]: followerHandles
   });
 }
 
@@ -68,6 +77,18 @@ function setActionTabId(tabId: number | null): void {
   void persistRuntime();
 }
 
+function setCollectedHandles(nextFollowing: string[], nextFollowers: string[]): void {
+  followingHandles = nextFollowing;
+  followerHandles = nextFollowers;
+  void persistRuntime();
+}
+
+function ensureNotScanStopped(): void {
+  if (scanStopRequested) {
+    throw new Error("候補取得を停止しました。");
+  }
+}
+
 async function ensureInitialized(): Promise<void> {
   if (initPromise) {
     await initPromise;
@@ -75,7 +96,13 @@ async function ensureInitialized(): Promise<void> {
   }
 
   initPromise = (async () => {
-    const saved = await chrome.storage.local.get([STATE_KEY, CANDIDATES_KEY, ACTION_TAB_ID_KEY]);
+    const saved = await chrome.storage.local.get([
+      STATE_KEY,
+      CANDIDATES_KEY,
+      ACTION_TAB_ID_KEY,
+      FOLLOWING_HANDLES_KEY,
+      FOLLOWER_HANDLES_KEY
+    ]);
     if (saved[STATE_KEY]) {
       state = { ...defaultState(), ...(saved[STATE_KEY] as Partial<RuntimeState>) };
     }
@@ -87,6 +114,18 @@ async function ensureInitialized(): Promise<void> {
     }
     if (typeof saved[ACTION_TAB_ID_KEY] === "number") {
       actionTabId = saved[ACTION_TAB_ID_KEY] as number;
+    }
+    if (Array.isArray(saved[FOLLOWING_HANDLES_KEY])) {
+      followingHandles = (saved[FOLLOWING_HANDLES_KEY] as unknown[])
+        .filter((x): x is string => typeof x === "string")
+        .map((x) => x.trim())
+        .filter(Boolean);
+    }
+    if (Array.isArray(saved[FOLLOWER_HANDLES_KEY])) {
+      followerHandles = (saved[FOLLOWER_HANDLES_KEY] as unknown[])
+        .filter((x): x is string => typeof x === "string")
+        .map((x) => x.trim())
+        .filter(Boolean);
     }
   })();
 
@@ -139,6 +178,24 @@ async function delay(ms: number): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new Error(`${label} がタイムアウトしました。ページを再読み込みして再実行してください。`));
+    }, timeoutMs);
+
+    promise
+      .then((value) => {
+        clearTimeout(timer);
+        resolve(value);
+      })
+      .catch((error) => {
+        clearTimeout(timer);
+        reject(error);
+      });
+  });
+}
+
 async function waitForContentScript(tabId: number, timeoutMs = 15000): Promise<void> {
   const started = Date.now();
   while (Date.now() - started < timeoutMs) {
@@ -182,7 +239,11 @@ async function ensureXTab(url: string): Promise<number> {
   } catch {
     // best effort
   }
-  await waitTabComplete(tab.id);
+  try {
+    await waitTabComplete(tab.id, 20000);
+  } catch {
+    // x.com は読み込み状態が長く続くことがあるため、content script 到達判定を優先
+  }
   await waitForContentScript(tab.id);
   return tab.id;
 }
@@ -208,33 +269,77 @@ async function resolveHandle(currentTab: chrome.tabs.Tab): Promise<string> {
 }
 
 async function collectHandlesOnOnce(url: string): Promise<CollectResult> {
+  ensureNotScanStopped();
   const tabId = await ensureXTab(url);
+  scanTabId = tabId;
   try {
-    const result = await sendMessageToTab<CollectResult>(tabId, {
-      type: "COLLECT_HANDLES",
-      targetCount: state.limit
-    });
+    const result = await withTimeout(
+      sendMessageToTab<CollectResult>(tabId, {
+        type: "COLLECT_HANDLES"
+      }),
+      LIST_COLLECTION_TIMEOUT_MS,
+      "候補取得"
+    );
     return result;
   } finally {
-    await chrome.tabs.remove(tabId);
+    scanTabId = null;
+    try {
+      await chrome.tabs.remove(tabId);
+    } catch {
+      // already closed
+    }
   }
 }
 
-async function collectHandlesOn(url: string): Promise<CollectResult> {
-  let best: CollectResult = { handles: [] };
-  for (let i = 0; i < 2; i += 1) {
+function mergeHandles(base: string[], next: string[]): { merged: string[]; added: number } {
+  const merged = [...base];
+  const seen = new Set(base.map((h) => h.toLowerCase()));
+  let added = 0;
+  for (const handle of next) {
+    const key = handle.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    merged.push(handle);
+    added += 1;
+  }
+  return { merged, added };
+}
+
+async function collectHandlesOn(url: string, desiredMinCount: number, label: "following" | "followers"): Promise<CollectResult> {
+  ensureNotScanStopped();
+  let merged: string[] = [];
+  let noGrowthRounds = 0;
+  const maxAttempts = 4;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    ensureNotScanStopped();
+    setState({
+      message: `対象 @${state.accountHandle ?? "-"}\n${label} 一覧を取得中... (${attempt}/${maxAttempts})`
+    });
+
     const current = await collectHandlesOnOnce(url);
-    if (current.handles.length > best.handles.length) {
-      best = current;
+    const result = mergeHandles(merged, current.handles);
+    merged = result.merged;
+
+    if (result.added === 0) {
+      noGrowthRounds += 1;
+    } else {
+      noGrowthRounds = 0;
     }
-    if (best.handles.length >= state.limit) {
+
+    if (merged.length >= desiredMinCount) {
+      break;
+    }
+    if (noGrowthRounds >= 2) {
       break;
     }
   }
-  return best;
+
+  return { handles: merged };
 }
 
 async function runScan(limit: number): Promise<void> {
+  scanStopRequested = false;
   setState({
     phase: "scanning",
     message: "\u5019\u88dc\u4ef6\u6570\u3092\u53d6\u5f97\u3057\u3066\u3044\u307e\u3059...",
@@ -252,6 +357,7 @@ async function runScan(limit: number): Promise<void> {
     finishedAt: null
   });
   setCandidates([]);
+  setCollectedHandles([], []);
   setActionTabId(null);
 
   const activeTab = await getActiveTab();
@@ -263,7 +369,14 @@ async function runScan(limit: number): Promise<void> {
   const followingUrl = `${X_ORIGIN}/${handle}/following`;
   const followersUrl = `${X_ORIGIN}/${handle}/followers`;
 
-  const [following, followers] = await Promise.all([collectHandlesOn(followingUrl), collectHandlesOn(followersUrl)]);
+  setState({ accountHandle: handle, message: `対象 @${handle}\nfollowing 一覧を取得中...` });
+  const following = await collectHandlesOn(followingUrl, limit, "following");
+  ensureNotScanStopped();
+  const followerDesired = Math.max(limit, following.handles.length);
+  setState({ message: `対象 @${handle}\nfollowers 一覧を取得中...` });
+  const followers = await collectHandlesOn(followersUrl, followerDesired, "followers");
+  ensureNotScanStopped();
+  setCollectedHandles(following.handles, followers.handles);
 
   const followerSet = new Set(followers.handles.map((h) => h.toLowerCase()));
   const unilateral = following.handles.filter((h) => !followerSet.has(h.toLowerCase()));
@@ -281,7 +394,7 @@ async function runScan(limit: number): Promise<void> {
       `\u5bfe\u8c61 @${handle}\n` +
       `\u7247\u601d\u3044\u30d5\u30a9\u30ed\u30ef\u30fc\u3092\u89e3\u9664\u3057\u307e\u3059\u304b\uff1f\n` +
       `\u4ef6\u6570 ${unilateral.length} \u4ef6 (\u4e0a\u9650 ${limit})\n` +
-      `following ${following.handles.length} / followers ${followers.handles.length}`
+      `取得 following ${following.handles.length} / followers ${followers.handles.length}`
   });
 }
 
@@ -391,16 +504,32 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         return;
       }
       case "STOP_UNFOLLOW": {
-        setState({
-          phase: "stopping",
-          stopRequested: true,
-          message: "\u505c\u6b62\u8981\u6c42\u3092\u9001\u4fe1\u3057\u307e\u3057\u305f..."
-        });
-        if (actionTabId !== null) {
-          try {
-            await sendMessageToTab(actionTabId, { type: "STOP_NOW" });
-          } catch {
-            // if tab is already closed, final state will be set by current flow
+        if (state.phase === "scanning") {
+          scanStopRequested = true;
+          setState({
+            phase: "stopping",
+            stopRequested: true,
+            message: "\u5019\u88dc\u53d6\u5f97\u306e\u505c\u6b62\u8981\u6c42\u3092\u9001\u4fe1\u3057\u307e\u3057\u305f..."
+          });
+          if (scanTabId !== null) {
+            try {
+              await sendMessageToTab(scanTabId, { type: "STOP_NOW" });
+            } catch {
+              // ignore if tab is already closing
+            }
+          }
+        } else {
+          setState({
+            phase: "stopping",
+            stopRequested: true,
+            message: "\u505c\u6b62\u8981\u6c42\u3092\u9001\u4fe1\u3057\u307e\u3057\u305f..."
+          });
+          if (actionTabId !== null) {
+            try {
+              await sendMessageToTab(actionTabId, { type: "STOP_NOW" });
+            } catch {
+              // if tab is already closed, final state will be set by current flow
+            }
           }
         }
         sendResponse({ ok: true, state });
@@ -425,6 +554,17 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     }
   })().catch((err: unknown) => {
     const messageText = err instanceof Error ? err.message : "Unknown error";
+    const isStopped = messageText.includes("停止しました");
+    if (isStopped) {
+      setState({
+        phase: "done",
+        message: messageText,
+        stopRequested: false,
+        finishedAt: Date.now()
+      });
+      sendResponse({ ok: true, state });
+      return;
+    }
     setState({
       phase: "error",
       message: `\u30a8\u30e9\u30fc: ${messageText}`,

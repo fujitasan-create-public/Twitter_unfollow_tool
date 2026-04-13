@@ -14,6 +14,8 @@ const RESERVED = new Set([
 ]);
 const JP_FOLLOWING = "\u30d5\u30a9\u30ed\u30fc\u4e2d";
 const JP_UNFOLLOW = "\u30d5\u30a9\u30ed\u30fc\u89e3\u9664";
+const USER_ROW_SELECTORS = ['[data-testid="UserCell"]', '[data-testid="cellInnerDiv"]'].join(", ");
+const LIST_LOADING_SELECTORS = ['[role="progressbar"]', '[data-testid="primaryColumn"] [aria-busy="true"]'].join(", ");
 let stopNow = false;
 function parseHandleFromPath(path) {
     const clean = path.split("?")[0].split("#")[0];
@@ -37,44 +39,75 @@ function randomDelay(minMs, maxMs) {
 function normalized(text) {
     return text.trim().toLowerCase();
 }
-async function waitForUserCells(timeoutMs = 20000) {
+function queryUserRows() {
+    return Array.from(document.querySelectorAll(USER_ROW_SELECTORS));
+}
+async function waitForUserCells(timeoutMs = 15000) {
     const start = Date.now();
     while (Date.now() - start < timeoutMs) {
-        if (document.querySelector('[data-testid="UserCell"]')) {
+        if (queryUserRows().length > 0) {
             return;
         }
         await sleep(250);
     }
+    throw new Error("ユーザー一覧を検出できませんでした。following/followersページを開いて再実行してください。");
+}
+function isListLoading() {
+    return document.querySelector(LIST_LOADING_SELECTORS) !== null;
 }
 function collectVisibleHandles(out) {
     const before = out.size;
-    const anchors = document.querySelectorAll('[data-testid="UserCell"] a[href^="/"]');
-    anchors.forEach((a) => {
-        const href = a.getAttribute("href");
-        if (!href)
-            return;
-        const handle = parseHandleFromPath(href);
-        if (handle)
-            out.add(handle);
-    });
+    const rows = queryUserRows();
+    for (const row of rows) {
+        const links = row.querySelectorAll('a[href^="/"]');
+        links.forEach((a) => {
+            const href = a.getAttribute("href");
+            if (!href)
+                return;
+            const handle = parseHandleFromPath(href);
+            if (handle)
+                out.add(handle);
+        });
+    }
+    if (rows.length === 0) {
+        const anchors = document.querySelectorAll('a[href^="/"]');
+        anchors.forEach((a) => {
+            const href = a.getAttribute("href");
+            if (!href)
+                return;
+            const handle = parseHandleFromPath(href);
+            if (handle)
+                out.add(handle);
+        });
+    }
     return out.size - before;
 }
 async function collectHandlesFromList(targetCount) {
+    stopNow = false;
     await waitForUserCells();
     const handles = new Set();
+    const started = Date.now();
+    let lastIncreaseAt = started;
+    const hasTarget = Number.isFinite(targetCount) && targetCount > 0;
+    const safeTarget = hasTarget ? Math.floor(targetCount) : Number.MAX_SAFE_INTEGER;
     let noIncreaseRounds = 0;
     let noHeightIncreaseRounds = 0;
     let rounds = 0;
     let lastHeight = 0;
-    while (rounds < 400 &&
-        handles.size < targetCount &&
-        (noIncreaseRounds < 18 || noHeightIncreaseRounds < 12)) {
+    // 初回ロードが重い場合に備えて、すぐに終了判定へ入らないよう少し待つ
+    await sleep(1800);
+    while (!stopNow &&
+        rounds < 320 &&
+        Date.now() - started < 300000 &&
+        handles.size < safeTarget &&
+        (noIncreaseRounds < 30 || noHeightIncreaseRounds < 20 || Date.now() - lastIncreaseAt < 25000 || isListLoading())) {
         const delta = collectVisibleHandles(handles);
         if (delta === 0) {
             noIncreaseRounds += 1;
         }
         else {
             noIncreaseRounds = 0;
+            lastIncreaseAt = Date.now();
         }
         const currentHeight = Math.max(document.body.scrollHeight, document.documentElement.scrollHeight);
         if (currentHeight <= lastHeight) {
@@ -84,11 +117,17 @@ async function collectHandlesFromList(targetCount) {
             noHeightIncreaseRounds = 0;
             lastHeight = currentHeight;
         }
-        window.scrollTo(0, currentHeight);
-        await sleep(1100);
+        window.scrollBy(0, Math.max(320, Math.floor(window.innerHeight * 0.7)));
+        await sleep(2000);
         rounds += 1;
     }
     window.scrollTo(0, 0);
+    if (stopNow) {
+        throw new Error("候補取得を停止しました。");
+    }
+    if (handles.size === 0) {
+        throw new Error("対象ユーザーを取得できませんでした。ページを再読み込みして再実行してください。");
+    }
     return Array.from(handles);
 }
 async function scrollUntilUserCell(handle) {
@@ -177,7 +216,7 @@ async function unfollowHandles(handles, minDelayMs, maxDelayMs) {
         if (stopNow || pending.size === 0)
             break;
         let roundProgress = 0;
-        const rows = document.querySelectorAll('[data-testid="UserCell"]');
+        const rows = queryUserRows();
         for (const row of rows) {
             if (stopNow || pending.size === 0)
                 break;
@@ -273,7 +312,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         }
         if (message?.type === "COLLECT_HANDLES") {
             const requested = Number(message.targetCount);
-            const targetCount = Number.isFinite(requested) && requested > 0 ? Math.floor(requested) : 1000;
+            const targetCount = Number.isFinite(requested) && requested > 0 ? Math.floor(requested) : undefined;
             const handles = await collectHandlesFromList(targetCount);
             sendResponse({ handles });
             return;
