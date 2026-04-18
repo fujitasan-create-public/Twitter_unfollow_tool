@@ -1,5 +1,7 @@
 # Twitter_unfollow_tool
 
+※現在バグが多く発生しています。詳しくはIssueを見てください。
+
 TypeScriptで作成したChrome拡張（Manifest V3）です。  
 「自分はフォローしているが、相手は自分をフォローしていない」アカウント候補を抽出し、上限件数まで解除します。
 
