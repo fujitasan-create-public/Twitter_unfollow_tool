@@ -44,6 +44,9 @@ function normalized(text) {
     return text.trim().toLowerCase();
 }
 function queryUserRows() {
+    const strictRows = Array.from(document.querySelectorAll('[data-testid="UserCell"]'));
+    if (strictRows.length > 0)
+        return strictRows;
     return Array.from(document.querySelectorAll(USER_ROW_SELECTORS));
 }
 async function waitForUserCells(timeoutMs = 15000) {
@@ -243,7 +246,9 @@ async function unfollowHandles(handles, minDelayMs, maxDelayMs) {
     };
     const failureSamples = [];
     const pending = new Set(handles.map((h) => h.toLowerCase()));
-    const attempted = new Set();
+    const failureRetries = new Map();
+    const lastTransientReason = new Map();
+    const MAX_TRANSIENT_RETRIES = 3;
     let noProgressRounds = 0;
     let noHeightIncreaseRounds = 0;
     let lastHeight = 0;
@@ -257,10 +262,17 @@ async function unfollowHandles(handles, minDelayMs, maxDelayMs) {
             failureSamples.push(line);
         }
     };
+    const markTransientFailure = (reason, key) => {
+        const next = (failureRetries.get(key) ?? 0) + 1;
+        failureRetries.set(key, next);
+        lastTransientReason.set(key, reason);
+        return next >= MAX_TRANSIENT_RETRIES;
+    };
     for (let round = 0; round < 600; round += 1) {
         if (stopNow || pending.size === 0)
             break;
         let roundProgress = 0;
+        const handledInRound = new Set();
         const rows = queryUserRows();
         for (const row of rows) {
             if (stopNow || pending.size === 0)
@@ -269,33 +281,48 @@ async function unfollowHandles(handles, minDelayMs, maxDelayMs) {
             if (!handle)
                 continue;
             const key = handle.toLowerCase();
-            if (!pending.has(key) || attempted.has(key))
+            if (!pending.has(key) || handledInRound.has(key))
                 continue;
-            attempted.add(key);
-            processed += 1;
+            handledInRound.add(key);
             const button = findUnfollowButton(row);
             if (!button) {
-                addFailure("unfollow_button_not_found", handle);
-                await chrome.runtime.sendMessage({ type: "PROGRESS", processed, succeeded, failed });
+                if (markTransientFailure("unfollow_button_not_found", key)) {
+                    pending.delete(key);
+                    processed += 1;
+                    addFailure("unfollow_button_not_found", handle);
+                    await chrome.runtime.sendMessage({ type: "PROGRESS", processed, succeeded, failed });
+                    roundProgress += 1;
+                }
                 continue;
             }
             if (button.disabled) {
-                addFailure("unfollow_button_disabled", handle);
-                await chrome.runtime.sendMessage({ type: "PROGRESS", processed, succeeded, failed });
+                if (markTransientFailure("unfollow_button_disabled", key)) {
+                    pending.delete(key);
+                    processed += 1;
+                    addFailure("unfollow_button_disabled", handle);
+                    await chrome.runtime.sendMessage({ type: "PROGRESS", processed, succeeded, failed });
+                    roundProgress += 1;
+                }
                 continue;
             }
             try {
                 button.click();
                 await clickConfirmIfPresent();
+                failureRetries.delete(key);
+                lastTransientReason.delete(key);
                 succeeded += 1;
+                processed += 1;
                 pending.delete(key);
                 roundProgress += 1;
                 await chrome.runtime.sendMessage({ type: "PROGRESS", processed, succeeded, failed });
             }
             catch (error) {
                 const detail = error instanceof Error ? error.message : "unknown";
+                pending.delete(key);
+                processed += 1;
                 addFailure("click_unfollow_failed", handle, detail);
                 await chrome.runtime.sendMessage({ type: "PROGRESS", processed, succeeded, failed });
+                roundProgress += 1;
                 continue;
             }
             const waitMs = randomDelay(minDelayMs, maxDelayMs);
@@ -324,7 +351,8 @@ async function unfollowHandles(handles, minDelayMs, maxDelayMs) {
     if (!stopNow && pending.size > 0) {
         for (const key of pending) {
             processed += 1;
-            addFailure("left_unprocessed", key);
+            const reason = lastTransientReason.get(key) ?? "left_unprocessed";
+            addFailure(reason, key);
         }
         await chrome.runtime.sendMessage({ type: "PROGRESS", processed, succeeded, failed });
     }
