@@ -17,6 +17,9 @@ const JP_UNFOLLOW = "\u30d5\u30a9\u30ed\u30fc\u89e3\u9664";
 const JP_FOLLOWS_YOU = "\u30d5\u30a9\u30ed\u30fc\u3055\u308c\u3066\u3044\u307e\u3059";
 const USER_ROW_SELECTORS = ['[data-testid="UserCell"]', '[data-testid="cellInnerDiv"]'].join(", ");
 const LIST_LOADING_SELECTORS = ['[role="progressbar"]', '[data-testid="primaryColumn"] [aria-busy="true"]'].join(", ");
+const SCAN_INITIAL_WAIT_MS = 450;
+const SCAN_SCROLL_MIN_WAIT_MS = 420;
+const SCAN_SCROLL_MAX_EXTRA_WAIT_MS = 780;
 
 let stopNow = false;
 
@@ -53,13 +56,21 @@ async function waitForUserCells(timeoutMs = 15000): Promise<void> {
     if (queryUserRows().length > 0) {
       return;
     }
-    await sleep(250);
+    await sleep(150);
   }
   throw new Error("ユーザー一覧を検出できませんでした。following/followersページを開いて再実行してください。");
 }
 
 function isListLoading(): boolean {
   return document.querySelector(LIST_LOADING_SELECTORS) !== null;
+}
+
+async function waitAfterScanScroll(): Promise<void> {
+  await sleep(SCAN_SCROLL_MIN_WAIT_MS);
+  const started = Date.now();
+  while (isListLoading() && Date.now() - started < SCAN_SCROLL_MAX_EXTRA_WAIT_MS) {
+    await sleep(120);
+  }
 }
 
 function collectVisibleHandles(out: Set<string>): number {
@@ -105,7 +116,7 @@ async function collectNonMutualFromFollowing(targetCount: number): Promise<{ han
   let lastHeight = 0;
 
   // 初回ロードが重い場合に備えて、すぐに終了判定へ入らないよう少し待つ
-  await sleep(1800);
+  await sleep(SCAN_INITIAL_WAIT_MS);
 
   while (
     !stopNow &&
@@ -144,7 +155,7 @@ async function collectNonMutualFromFollowing(targetCount: number): Promise<{ han
     }
 
     window.scrollBy(0, Math.max(320, Math.floor(window.innerHeight * 0.7)));
-    await sleep(2000);
+    await waitAfterScanScroll();
     rounds += 1;
   }
   window.scrollTo(0, 0);
@@ -226,7 +237,7 @@ function getHandleFromUserCell(row: HTMLElement): string | null {
   return null;
 }
 
-async function clickConfirmIfPresent(): Promise<void> {
+async function clickConfirmIfPresent(): Promise<boolean> {
   await sleep(300);
   const confirm =
     document.querySelector<HTMLButtonElement>('[data-testid="confirmationSheetConfirm"]') ??
@@ -237,14 +248,29 @@ async function clickConfirmIfPresent(): Promise<void> {
     });
   if (confirm) {
     confirm.click();
+    return true;
   }
+  return false;
 }
 
 async function unfollowHandles(handles: string[], minDelayMs: number, maxDelayMs: number) {
+  type FailureReason =
+    | "unfollow_button_not_found"
+    | "unfollow_button_disabled"
+    | "click_unfollow_failed"
+    | "left_unprocessed";
+
   stopNow = false;
   let processed = 0;
   let succeeded = 0;
   let failed = 0;
+  const failureReasonCounts: Record<FailureReason, number> = {
+    unfollow_button_not_found: 0,
+    unfollow_button_disabled: 0,
+    click_unfollow_failed: 0,
+    left_unprocessed: 0
+  };
+  const failureSamples: string[] = [];
   const pending = new Set(handles.map((h) => h.toLowerCase()));
   const attempted = new Set<string>();
   let noProgressRounds = 0;
@@ -253,6 +279,15 @@ async function unfollowHandles(handles: string[], minDelayMs: number, maxDelayMs
 
   window.scrollTo(0, 0);
   await sleep(600);
+
+  const addFailure = (reason: FailureReason, handle: string, detail?: string): void => {
+    failed += 1;
+    failureReasonCounts[reason] += 1;
+    if (failureSamples.length < 8) {
+      const line = detail ? `@${handle}: ${reason} (${detail})` : `@${handle}: ${reason}`;
+      failureSamples.push(line);
+    }
+  };
 
   for (let round = 0; round < 600; round += 1) {
     if (stopNow || pending.size === 0) break;
@@ -271,18 +306,30 @@ async function unfollowHandles(handles: string[], minDelayMs: number, maxDelayMs
       processed += 1;
 
       const button = findUnfollowButton(row);
-      if (!button || button.disabled) {
-        failed += 1;
+      if (!button) {
+        addFailure("unfollow_button_not_found", handle);
+        await chrome.runtime.sendMessage({ type: "PROGRESS", processed, succeeded, failed });
+        continue;
+      }
+      if (button.disabled) {
+        addFailure("unfollow_button_disabled", handle);
         await chrome.runtime.sendMessage({ type: "PROGRESS", processed, succeeded, failed });
         continue;
       }
 
-      button.click();
-      await clickConfirmIfPresent();
-      succeeded += 1;
-      pending.delete(key);
-      roundProgress += 1;
-      await chrome.runtime.sendMessage({ type: "PROGRESS", processed, succeeded, failed });
+      try {
+        button.click();
+        await clickConfirmIfPresent();
+        succeeded += 1;
+        pending.delete(key);
+        roundProgress += 1;
+        await chrome.runtime.sendMessage({ type: "PROGRESS", processed, succeeded, failed });
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : "unknown";
+        addFailure("click_unfollow_failed", handle, detail);
+        await chrome.runtime.sendMessage({ type: "PROGRESS", processed, succeeded, failed });
+        continue;
+      }
 
       const waitMs = randomDelay(minDelayMs, maxDelayMs);
       await sleep(waitMs);
@@ -311,8 +358,10 @@ async function unfollowHandles(handles: string[], minDelayMs: number, maxDelayMs
   }
 
   if (!stopNow && pending.size > 0) {
-    failed += pending.size;
-    processed += pending.size;
+    for (const key of pending) {
+      processed += 1;
+      addFailure("left_unprocessed", key);
+    }
     await chrome.runtime.sendMessage({ type: "PROGRESS", processed, succeeded, failed });
   }
 
@@ -320,6 +369,8 @@ async function unfollowHandles(handles: string[], minDelayMs: number, maxDelayMs
     processed,
     succeeded,
     failed,
+    failureReasonCounts,
+    failureSamples,
     stopped: stopNow
   };
 }

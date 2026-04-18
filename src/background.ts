@@ -1,8 +1,8 @@
 ﻿import type { RuntimeState } from "./types";
 
 const DEFAULT_LIMIT = 1000;
-const MIN_DELAY_MS = 3000;
-const MAX_DELAY_MS = 8000;
+const MIN_DELAY_MS = 2000;
+const MAX_DELAY_MS = 5000;
 const LIST_COLLECTION_TIMEOUT_MS = 420000;
 const X_ORIGIN = "https://x.com";
 const STATE_KEY = "runtimeState";
@@ -56,6 +56,12 @@ type NonMutualCollectResult = {
   handles: string[];
   scannedFollowing: number;
 };
+
+type FailureReasonCode =
+  | "unfollow_button_not_found"
+  | "unfollow_button_disabled"
+  | "click_unfollow_failed"
+  | "left_unprocessed";
 
 async function persistRuntime(): Promise<void> {
   await chrome.storage.local.set({
@@ -315,7 +321,6 @@ async function collectHandlesOn(url: string, desiredMinCount: number): Promise<N
   ensureNotScanStopped();
   let merged: string[] = [];
   let scannedFollowing = 0;
-  let noGrowthRounds = 0;
   const maxAttempts = 3;
 
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
@@ -328,19 +333,6 @@ async function collectHandlesOn(url: string, desiredMinCount: number): Promise<N
     const result = mergeHandles(merged, current.handles);
     merged = result.merged;
     scannedFollowing = Math.max(scannedFollowing, current.scannedFollowing);
-
-    if (result.added === 0) {
-      noGrowthRounds += 1;
-    } else {
-      noGrowthRounds = 0;
-    }
-
-    if (merged.length >= desiredMinCount) {
-      break;
-    }
-    if (noGrowthRounds >= 2) {
-      break;
-    }
   }
 
   return { handles: merged, scannedFollowing };
@@ -445,10 +437,27 @@ async function runUnfollow(): Promise<void> {
     targetCount
   });
 
+  const toFailureReasonLabel = (reason: FailureReasonCode): string => {
+    switch (reason) {
+      case "unfollow_button_not_found":
+        return "解除ボタンが見つからない";
+      case "unfollow_button_disabled":
+        return "解除ボタンが無効";
+      case "click_unfollow_failed":
+        return "解除クリック処理で例外";
+      case "left_unprocessed":
+        return "対象を最後まで処理できず";
+      default:
+        return reason;
+    }
+  };
+
   const result = await sendMessageToTab<{
     processed: number;
     succeeded: number;
     failed: number;
+    failureReasonCounts?: Partial<Record<FailureReasonCode, number>>;
+    failureSamples?: string[];
     stopped: boolean;
   }>(tabId, {
     type: "UNFOLLOW_HANDLES",
@@ -467,9 +476,21 @@ async function runUnfollow(): Promise<void> {
       finishedAt: Date.now()
     });
   } else {
+    const reasonEntries = Object.entries(result.failureReasonCounts ?? {})
+      .filter((entry): entry is [FailureReasonCode, number] => Number(entry[1]) > 0)
+      .sort((a, b) => b[1] - a[1]);
+    const reasonSummary = reasonEntries.length
+      ? `\n失敗内訳: ${reasonEntries
+          .map(([reason, count]) => `${toFailureReasonLabel(reason)} ${count}件`)
+          .join(" / ")}`
+      : "";
+    const sampleSummary =
+      Array.isArray(result.failureSamples) && result.failureSamples.length > 0
+        ? `\n失敗例: ${result.failureSamples.slice(0, 3).join(" | ")}`
+        : "";
     setState({
       phase: "done",
-      message: `\u5b8c\u4e86\u3057\u307e\u3057\u305f\u3002${result.succeeded}\u4ef6\u89e3\u9664 / \u5931\u6557${result.failed}\u4ef6`,
+      message: `\u5b8c\u4e86\u3057\u307e\u3057\u305f\u3002${result.succeeded}\u4ef6\u89e3\u9664 / \u5931\u6557${result.failed}\u4ef6${reasonSummary}${sampleSummary}`,
       processed: result.processed,
       succeeded: result.succeeded,
       failed: result.failed,

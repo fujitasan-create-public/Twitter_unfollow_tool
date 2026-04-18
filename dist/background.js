@@ -1,6 +1,6 @@
 const DEFAULT_LIMIT = 1000;
-const MIN_DELAY_MS = 3000;
-const MAX_DELAY_MS = 8000;
+const MIN_DELAY_MS = 2000;
+const MAX_DELAY_MS = 5000;
 const LIST_COLLECTION_TIMEOUT_MS = 420000;
 const X_ORIGIN = "https://x.com";
 const STATE_KEY = "runtimeState";
@@ -285,7 +285,6 @@ async function collectHandlesOn(url, desiredMinCount) {
     ensureNotScanStopped();
     let merged = [];
     let scannedFollowing = 0;
-    let noGrowthRounds = 0;
     const maxAttempts = 3;
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
         ensureNotScanStopped();
@@ -296,18 +295,6 @@ async function collectHandlesOn(url, desiredMinCount) {
         const result = mergeHandles(merged, current.handles);
         merged = result.merged;
         scannedFollowing = Math.max(scannedFollowing, current.scannedFollowing);
-        if (result.added === 0) {
-            noGrowthRounds += 1;
-        }
-        else {
-            noGrowthRounds = 0;
-        }
-        if (merged.length >= desiredMinCount) {
-            break;
-        }
-        if (noGrowthRounds >= 2) {
-            break;
-        }
     }
     return { handles: merged, scannedFollowing };
 }
@@ -399,6 +386,20 @@ async function runUnfollow() {
         finishedAt: null,
         targetCount
     });
+    const toFailureReasonLabel = (reason) => {
+        switch (reason) {
+            case "unfollow_button_not_found":
+                return "解除ボタンが見つからない";
+            case "unfollow_button_disabled":
+                return "解除ボタンが無効";
+            case "click_unfollow_failed":
+                return "解除クリック処理で例外";
+            case "left_unprocessed":
+                return "対象を最後まで処理できず";
+            default:
+                return reason;
+        }
+    };
     const result = await sendMessageToTab(tabId, {
         type: "UNFOLLOW_HANDLES",
         handles: candidates.slice(0, targetCount),
@@ -416,9 +417,20 @@ async function runUnfollow() {
         });
     }
     else {
+        const reasonEntries = Object.entries(result.failureReasonCounts ?? {})
+            .filter((entry) => Number(entry[1]) > 0)
+            .sort((a, b) => b[1] - a[1]);
+        const reasonSummary = reasonEntries.length
+            ? `\n失敗内訳: ${reasonEntries
+                .map(([reason, count]) => `${toFailureReasonLabel(reason)} ${count}件`)
+                .join(" / ")}`
+            : "";
+        const sampleSummary = Array.isArray(result.failureSamples) && result.failureSamples.length > 0
+            ? `\n失敗例: ${result.failureSamples.slice(0, 3).join(" | ")}`
+            : "";
         setState({
             phase: "done",
-            message: `\u5b8c\u4e86\u3057\u307e\u3057\u305f\u3002${result.succeeded}\u4ef6\u89e3\u9664 / \u5931\u6557${result.failed}\u4ef6`,
+            message: `\u5b8c\u4e86\u3057\u307e\u3057\u305f\u3002${result.succeeded}\u4ef6\u89e3\u9664 / \u5931\u6557${result.failed}\u4ef6${reasonSummary}${sampleSummary}`,
             processed: result.processed,
             succeeded: result.succeeded,
             failed: result.failed,

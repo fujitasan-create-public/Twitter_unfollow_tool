@@ -17,6 +17,9 @@ const JP_UNFOLLOW = "\u30d5\u30a9\u30ed\u30fc\u89e3\u9664";
 const JP_FOLLOWS_YOU = "\u30d5\u30a9\u30ed\u30fc\u3055\u308c\u3066\u3044\u307e\u3059";
 const USER_ROW_SELECTORS = ['[data-testid="UserCell"]', '[data-testid="cellInnerDiv"]'].join(", ");
 const LIST_LOADING_SELECTORS = ['[role="progressbar"]', '[data-testid="primaryColumn"] [aria-busy="true"]'].join(", ");
+const SCAN_INITIAL_WAIT_MS = 450;
+const SCAN_SCROLL_MIN_WAIT_MS = 420;
+const SCAN_SCROLL_MAX_EXTRA_WAIT_MS = 780;
 let stopNow = false;
 function parseHandleFromPath(path) {
     const clean = path.split("?")[0].split("#")[0];
@@ -49,12 +52,19 @@ async function waitForUserCells(timeoutMs = 15000) {
         if (queryUserRows().length > 0) {
             return;
         }
-        await sleep(250);
+        await sleep(150);
     }
     throw new Error("ユーザー一覧を検出できませんでした。following/followersページを開いて再実行してください。");
 }
 function isListLoading() {
     return document.querySelector(LIST_LOADING_SELECTORS) !== null;
+}
+async function waitAfterScanScroll() {
+    await sleep(SCAN_SCROLL_MIN_WAIT_MS);
+    const started = Date.now();
+    while (isListLoading() && Date.now() - started < SCAN_SCROLL_MAX_EXTRA_WAIT_MS) {
+        await sleep(120);
+    }
 }
 function collectVisibleHandles(out) {
     const before = out.size;
@@ -99,7 +109,7 @@ async function collectNonMutualFromFollowing(targetCount) {
     let rounds = 0;
     let lastHeight = 0;
     // 初回ロードが重い場合に備えて、すぐに終了判定へ入らないよう少し待つ
-    await sleep(1800);
+    await sleep(SCAN_INITIAL_WAIT_MS);
     while (!stopNow &&
         rounds < 320 &&
         Date.now() - started < 300000 &&
@@ -133,7 +143,7 @@ async function collectNonMutualFromFollowing(targetCount) {
             lastHeight = currentHeight;
         }
         window.scrollBy(0, Math.max(320, Math.floor(window.innerHeight * 0.7)));
-        await sleep(2000);
+        await waitAfterScanScroll();
         rounds += 1;
     }
     window.scrollTo(0, 0);
@@ -216,13 +226,22 @@ async function clickConfirmIfPresent() {
         });
     if (confirm) {
         confirm.click();
+        return true;
     }
+    return false;
 }
 async function unfollowHandles(handles, minDelayMs, maxDelayMs) {
     stopNow = false;
     let processed = 0;
     let succeeded = 0;
     let failed = 0;
+    const failureReasonCounts = {
+        unfollow_button_not_found: 0,
+        unfollow_button_disabled: 0,
+        click_unfollow_failed: 0,
+        left_unprocessed: 0
+    };
+    const failureSamples = [];
     const pending = new Set(handles.map((h) => h.toLowerCase()));
     const attempted = new Set();
     let noProgressRounds = 0;
@@ -230,6 +249,14 @@ async function unfollowHandles(handles, minDelayMs, maxDelayMs) {
     let lastHeight = 0;
     window.scrollTo(0, 0);
     await sleep(600);
+    const addFailure = (reason, handle, detail) => {
+        failed += 1;
+        failureReasonCounts[reason] += 1;
+        if (failureSamples.length < 8) {
+            const line = detail ? `@${handle}: ${reason} (${detail})` : `@${handle}: ${reason}`;
+            failureSamples.push(line);
+        }
+    };
     for (let round = 0; round < 600; round += 1) {
         if (stopNow || pending.size === 0)
             break;
@@ -247,17 +274,30 @@ async function unfollowHandles(handles, minDelayMs, maxDelayMs) {
             attempted.add(key);
             processed += 1;
             const button = findUnfollowButton(row);
-            if (!button || button.disabled) {
-                failed += 1;
+            if (!button) {
+                addFailure("unfollow_button_not_found", handle);
                 await chrome.runtime.sendMessage({ type: "PROGRESS", processed, succeeded, failed });
                 continue;
             }
-            button.click();
-            await clickConfirmIfPresent();
-            succeeded += 1;
-            pending.delete(key);
-            roundProgress += 1;
-            await chrome.runtime.sendMessage({ type: "PROGRESS", processed, succeeded, failed });
+            if (button.disabled) {
+                addFailure("unfollow_button_disabled", handle);
+                await chrome.runtime.sendMessage({ type: "PROGRESS", processed, succeeded, failed });
+                continue;
+            }
+            try {
+                button.click();
+                await clickConfirmIfPresent();
+                succeeded += 1;
+                pending.delete(key);
+                roundProgress += 1;
+                await chrome.runtime.sendMessage({ type: "PROGRESS", processed, succeeded, failed });
+            }
+            catch (error) {
+                const detail = error instanceof Error ? error.message : "unknown";
+                addFailure("click_unfollow_failed", handle, detail);
+                await chrome.runtime.sendMessage({ type: "PROGRESS", processed, succeeded, failed });
+                continue;
+            }
             const waitMs = randomDelay(minDelayMs, maxDelayMs);
             await sleep(waitMs);
         }
@@ -282,14 +322,18 @@ async function unfollowHandles(handles, minDelayMs, maxDelayMs) {
         await sleep(900);
     }
     if (!stopNow && pending.size > 0) {
-        failed += pending.size;
-        processed += pending.size;
+        for (const key of pending) {
+            processed += 1;
+            addFailure("left_unprocessed", key);
+        }
         await chrome.runtime.sendMessage({ type: "PROGRESS", processed, succeeded, failed });
     }
     return {
         processed,
         succeeded,
         failed,
+        failureReasonCounts,
+        failureSamples,
         stopped: stopNow
     };
 }
